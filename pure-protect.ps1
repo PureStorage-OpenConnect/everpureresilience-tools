@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 # Capture full script content at top level (required for Invoke-Expression scenarios)
 $script:ScriptContent = $MyInvocation.MyCommand.ScriptBlock.ToString()
 
-$script:ScriptVersion = "2.8.0"
+$script:ScriptVersion = "2.25.0"
 $script:InstallPath = "C:\PureProtect\Scripts\configurator.ps1"
 $script:InstallDir = Split-Path -Parent $script:InstallPath
 $script:LogTimestampSuffix = (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss")
@@ -510,14 +510,30 @@ function Test-AdminPrivileges {
 
 <#
 .SYNOPSIS
-    Returns $true when the given return code or HRESULT is a transient error worth retrying.
+    Returns $true when the given error is transient and worth retrying.
+.DESCRIPTION
+    A CimException carries the WBEM status in NativeErrorCode and in MessageId ("HRESULT 0x80041002");
+    its HResult is the generic managed 0x80131500, so HResult is only a fallback for non-CIM errors.
+
+    CDXML cmdlets (Get-NetIPAddress, Get-NetRoute, ...) throw CimJobException on a zero-match query
+    instead - no NativeErrorCode/MessageId, generic HResult - so matched via FullyQualifiedErrorId
+    "CmdletizationQuery_NotFound,<CmdletName>" (confirmed live).
 #>
 function Test-TransientCimError {
-    param([int64]$Code)
-    $normalized = $Code -band [int64]0xFFFFFFFF
+    param($ErrorRecord)
+
+    if ($ErrorRecord.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound,*') {
+        return $true
+    }
+
+    $exception = $ErrorRecord.Exception
+    if (-not $exception) {
+        return $false
+    }
 
     # These are not inherently transient, but in this context the CIM object was just found
     # moments before - so "not found" means the device is mid-transition, not permanently gone.
+    $transientNativeErrorCodes = @('NotFound', 'ServerIsShuttingDown')
     $transientCodes = @(
         [int64]2147943568   # 0x80070490 = HRESULT wrapping Win32 ERROR_NOT_FOUND (1168)
         [int64]2147749890   # 0x80041002 = WBEM_E_NOT_FOUND
@@ -526,7 +542,22 @@ function Test-TransientCimError {
         [int64]2147749993   # 0x80041069 = WBEM_E_TIMED_OUT
         [int64]2147750024   # 0x80041088 = WBEM_E_PROVIDER_TIMED_OUT
     )
-    return $normalized -in $transientCodes
+
+    if ($exception.PSObject.Properties['NativeErrorCode'] -and
+        ([string]$exception.NativeErrorCode) -in $transientNativeErrorCodes) {
+        return $true
+    }
+
+    $code = $null
+    if ($exception.PSObject.Properties['MessageId'] -and
+        "$($exception.MessageId)" -match '0x([0-9A-Fa-f]{8})') {
+        $code = [Convert]::ToInt64($matches[1], 16)
+    }
+    elseif ($null -ne $exception.HResult) {
+        $code = [int64]$exception.HResult -band [int64]4294967295
+    }
+
+    return $code -in $transientCodes
 }
 
 <#
@@ -575,10 +606,9 @@ function Invoke-CimMethodWithRetry {
 
         # ── Thrown exception, retry only if transient ──
         if ($cimError) {
-            $hr = $cimError.Exception.HResult
-            if ((Test-TransientCimError $hr) -and ($attempt -lt $maxAttempts)) {
+            if ((Test-TransientCimError $cimError) -and ($attempt -lt $maxAttempts)) {
                 $delay = $retryDelays[$attempt - 1]
-                Write-Host "[Network configuration] $MethodName threw a transient exception ($hr): $($cimError.Exception.Message). Retry $attempt/$($retryDelays.Length) in ${delay}s..."
+                Write-Host "[Network configuration] $MethodName threw a transient exception ($($cimError.Exception.NativeErrorCode)/$($cimError.Exception.MessageId)): $($cimError.Exception.Message). Retry $attempt/$($retryDelays.Length) in ${delay}s..."
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -594,7 +624,9 @@ function Invoke-CimMethodWithRetry {
         }
 
         # ── Transient return value, retry ──
-        if ((Test-TransientCimError $result.ReturnValue) -and ($attempt -lt $maxAttempts)) {
+        # 97 means TCP/IP is not bound on the adapter yet, which stops once it is bound.
+        # Both callers have a fallback for a 97 that is still returned after the retries.
+        if (($result.ReturnValue -eq 97) -and ($attempt -lt $maxAttempts)) {
             $delay = $retryDelays[$attempt - 1]
             Write-Host "[Network configuration] $MethodName returned transient error $($result.ReturnValue). Retry $attempt/$($retryDelays.Length) in ${delay}s..."
             Start-Sleep -Seconds $delay
@@ -634,17 +666,58 @@ function Set-StaticIPViaCim {
     }
 
     if ($result.ReturnValue -in @(0, 1)) {
+        if ($result.ReturnValue -eq 1) {
+            Write-Host "[Network configuration] EnableStatic succeeded but reports that a reboot is required"
+        }
         return
     }
 
     if ($result.ReturnValue -eq 97) {
-        # DHCP already disabled, no existing IP
         Write-Host "[Network configuration] EnableStatic returned 97, falling back to New-NetIPAddress"
-        New-NetIPAddress -InterfaceIndex $InterfaceIndex -IPAddress $IPAddress -PrefixLength $PrefixLength -AddressFamily IPv4 -ErrorAction Stop
+        # New-NetIPAddress adds an address, so drop the source ones to match EnableStatic's replace.
+        # Both calls log a failure and carry on, the IP check at the end of Configure-Network decides.
+        Get-NetIPAddress -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Remove-NetIPAddress -Confirm:$false -ErrorAction Continue
+        New-NetIPAddress -InterfaceIndex $InterfaceIndex -IPAddress $IPAddress -PrefixLength $PrefixLength -AddressFamily IPv4 -ErrorAction Continue
         return
     }
 
     throw "[Network configuration] EnableStatic failed with return code $($result.ReturnValue)"
+}
+
+<#
+.SYNOPSIS
+    Gets the IPv4 addresses on an interface, retrying on transient CIM errors.
+.DESCRIPTION
+    Get-NetIPAddress throws a terminating "no matching objects found" error when its CIM query
+    matches nothing, regardless of $ErrorActionPreference. Right after DHCP/gateway/DNS changes
+    the MSFT_NetIPAddress instance can briefly be unqueryable, so this retries like the other
+    CIM calls in this file instead of letting a transient miss fail the whole NIC configuration.
+    Retries up to 4 times with exponential backoff, mirroring Invoke-CimMethodWithRetry.
+#>
+function Get-NetIPAddressWithRetry {
+    param(
+        [string]$InterfaceAlias
+    )
+
+    $retryDelays = @(5, 10, 20, 40)
+    $maxAttempts = $retryDelays.Length + 1
+    $attempt     = 0
+
+    while ($true) {
+        $attempt++
+        try {
+            return @((Get-NetIPAddress -InterfaceAlias $InterfaceAlias -AddressFamily IPv4 -ErrorAction Stop).IPAddress)
+        } catch {
+            if ((Test-TransientCimError $_) -and ($attempt -lt $maxAttempts)) {
+                $delay = $retryDelays[$attempt - 1]
+                Write-Host "[Network configuration] Get-NetIPAddress threw a transient exception ($($_.FullyQualifiedErrorId)): $($_.Exception.Message). Retry $attempt/$($retryDelays.Length) in ${delay}s..."
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            throw
+        }
+    }
 }
 
 <#
@@ -678,10 +751,9 @@ function Remove-GatewayWithRetry {
             }
             return
         } catch {
-            $hr = $_.Exception.HResult
-            if ((Test-TransientCimError $hr) -and ($attempt -lt $maxAttempts)) {
+            if ((Test-TransientCimError $_) -and ($attempt -lt $maxAttempts)) {
                 $delay = $retryDelays[$attempt - 1]
-                Write-Host "[Network configuration] Remove-NetRoute threw a transient exception ($hr): $($_.Exception.Message). Retry $attempt/$($retryDelays.Length) in ${delay}s..."
+                Write-Host "[Network configuration] Remove-NetRoute threw a transient exception ($($_.Exception.NativeErrorCode)/$($_.Exception.MessageId)): $($_.Exception.Message). Retry $attempt/$($retryDelays.Length) in ${delay}s..."
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -693,6 +765,7 @@ function Remove-GatewayWithRetry {
 <#
 .SYNOPSIS
     Sets the default gateway via Win32_NetworkAdapterConfiguration.SetGateways().
+    Falls back to New-NetRoute on return code 97.
 #>
 function Set-GatewayViaCim {
     param(
@@ -702,9 +775,19 @@ function Set-GatewayViaCim {
 
     $gwArgs = @{ DefaultIPGateway = [string[]]@($DefaultGateway); GatewayCostMetric = [uint16[]]@(1) }
     $result = Invoke-CimMethodWithRetry -InterfaceIndex $InterfaceIndex -MethodName 'SetGateways' -Arguments $gwArgs
-    if ($result.ReturnValue -notin @(0, 1)) {
-        throw "[Network configuration] SetGateways failed with return code $($result.ReturnValue)"
+    if ($result.ReturnValue -in @(0, 1)) {
+        return
     }
+
+    if ($result.ReturnValue -eq 97) {
+        Write-Host "[Network configuration] SetGateways returned 97, falling back to New-NetRoute"
+        # New-NetRoute fails when the route exists, so drop any leftover default route first.
+        Remove-GatewayWithRetry -InterfaceIndex $InterfaceIndex
+        New-NetRoute -InterfaceIndex $InterfaceIndex -DestinationPrefix '0.0.0.0/0' -NextHop $DefaultGateway -RouteMetric 1 -ErrorAction Stop | Out-Null
+        return
+    }
+
+    throw "[Network configuration] SetGateways failed with return code $($result.ReturnValue)"
 }
 
 <#
@@ -730,7 +813,9 @@ function Wait-AdapterAccessible {
 }
 
 function Configure-Network {
-    $nics = @(Get-NicData)
+    param(
+        [array]$Nics
+    )
 
     if (-not $script:NetworkConfigPresent) {
         return
@@ -740,7 +825,7 @@ function Configure-Network {
     ipconfig /all
 
     $adapterDisconnected = $false
-    foreach ($nic in $nics) {
+    foreach ($nic in $Nics) {
         $TargetMac     = $nic.macAddress
         $CIDR          = $nic.ipAddress
         $NewGateway    = $nic.defaultGateway
@@ -795,10 +880,11 @@ function Configure-Network {
             Wait-AdapterAccessible -InterfaceAlias $alias | Out-Null
 
             # ─── Verify IP configuration ─────────────────────────────────────────
-            $ipAddress = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4
+            # Any address other than the new one means a source address is still assigned.
+            $ipAddresses = Get-NetIPAddressWithRetry -InterfaceAlias $alias
             Write-Host "[Network configuration] Verified IP configuration for $alias"
-            if ($ipAddress.IPAddress -ne $NewIPv4) {
-                throw "[Network configuration] Setting of a new IP failed - " + $ipAddress.IPAddress + " vs $NewIPv4"
+            if ($ipAddresses -ne $NewIPv4) {
+                throw "[Network configuration] Setting of a new IP failed - $($ipAddresses -join ', ') vs $NewIPv4"
             }
             
             $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue
@@ -816,12 +902,304 @@ function Configure-Network {
         }
     }
 
+    # Flush freshly-applied settings to disk so they survive an immediate snapshot / re-protection.
+    Invoke-NetworkRegistryFlush
+
     if ($adapterDisconnected) {
         Report-NetworkResult -ExitCode 23 -Message "[Network configuration] At least one adapter is disconnected"
         return
     }
 
     Report-NetworkResult -ExitCode 0 -Message "[Network configuration] Network configuration completed successfully"
+}
+
+<#
+.SYNOPSIS
+    Forces the kernel registry manager to flush dirty TCP/IP interface hive pages to disk so the
+    freshly-applied network configuration survives an immediate snapshot / re-protection of the VM.
+.DESCRIPTION
+    Saving the Tcpip\Parameters\Interfaces key with `reg save` triggers a hive flush as a side
+    effect; the temporary output file is discarded. Best-effort - failures are logged, not fatal.
+#>
+function Invoke-NetworkRegistryFlush {
+    $tmpHive = Join-Path $env:TEMP "tcpip_flush_$(Get-Random).hiv"
+    try {
+        & reg save "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" $tmpHive /y 2>&1 | Out-Null
+        Remove-Item $tmpHive -Force -ErrorAction SilentlyContinue
+        Write-Host "[Network configuration] Registry hive flushed successfully"
+    }
+    catch {
+        Write-Warning "[Network configuration] Registry hive flush failed: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-Reboot {
+    param([string]$Reason = "Rebooting machine...")
+    Write-Host $Reason
+    shutdown.exe /r /t 5 /f
+    Stop-Transcript | Out-Null
+    exit 0
+}
+
+<#
+.SYNOPSIS
+    Returns $true when every target MAC already resolves to a physical adapter.
+    This mirrors the lookup used by the NIC-configuration loop, so a $false result
+    means that loop is about to fail with "No adapter with MAC ... found".
+#>
+function Test-TargetAdaptersHealthy {
+    param(
+        [array]$NicsParam
+    )
+
+    foreach ($nic in $NicsParam) {
+        $macClean = ($nic.macAddress -replace '[:-]', '').ToUpper()
+        $adapter  = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
+                        (($_.MacAddress -replace '[:-]', '').ToUpper()) -eq $macClean
+                    } | Select-Object -First 1
+        if (-not $adapter) {
+            Write-Host "No usable adapter found yet for MAC $($nic.macAddress)."
+            return $false
+        }
+    }
+    return $true
+}
+
+
+<#
+.SYNOPSIS
+    Returns $true only when there is positive evidence this guest was recently running on AWS
+    (i.e. a V2AWS failback). This is the attribution gate that keeps the invasive netcfg -d
+    remediation from ever firing on a VM that was never on AWS just because an adapter is faulted.
+.DESCRIPTION
+    Looks for durable AWS-provenance markers the AWS leg leaves behind on the disk:
+      • an Amazon Elastic Network Adapter / ENA net device (Amazon PCI vendor id VEN_1D0F),
+        present or phantom
+      • AWS PV / EC2 guest agents and drivers (AWSLiteAgent, AmazonSSMAgent, Ec2Config, xennet, xenvbd)
+      • AWS install directories under Program Files / ProgramData
+    Teredo/ISATAP tunnel adapters are deliberately NOT used - they exist on stock Windows and carry
+    no AWS provenance.
+#>
+function Test-AwsProvenance {
+    $evidence = @()
+
+    # AWS network devices (present or phantom). The ENA uses Amazon's PCI vendor id 1D0F.
+    try {
+        $awsNet = Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | Where-Object {
+                      $_.FriendlyName -match 'Amazon|Elastic Network Adapter|AWS PV' -or
+                      $_.InstanceId  -match 'VEN_1D0F'
+                  }
+        if ($awsNet) {
+            $evidence += "net device(s): $((@($awsNet.FriendlyName) | Select-Object -Unique) -join ', ')"
+        }
+    }
+    catch {
+        Write-Warning "Get-PnpDevice query failed: $($_.Exception.Message)"
+    }
+
+    # AWS guest agents / PV drivers installed during the AWS leg.
+    try {
+        $awsSvc = Get-Service -ErrorAction SilentlyContinue | Where-Object {
+                      $_.Name -in @('AWSLiteAgent', 'AmazonSSMAgent', 'Ec2Config', 'xennet', 'xenvbd')
+                  }
+        if ($awsSvc) {
+            $evidence += "service(s): $((@($awsSvc.Name)) -join ', ')"
+        }
+    }
+    catch { }
+
+    # AWS install footprint on disk.
+    foreach ($path in @("$env:ProgramFiles\Amazon", "$env:ProgramData\Amazon")) {
+        if (Test-Path $path) {
+            $evidence += "path: $path"
+        }
+    }
+
+    if ($evidence.Count -gt 0) {
+        Write-Host "AWS provenance detected -> $($evidence -join '; ')"
+        return $true
+    }
+
+    Write-Host "No AWS provenance markers found."
+    return $false
+}
+
+
+<#
+.SYNOPSIS
+    Returns $true when a VMware NIC (vmxnet3; VMware PCI vendor id VEN_15AD) is stuck in a
+    device-manager error state such as CM_PROB_REGISTRY / Code 19 - the exact symptom this
+    remediation repairs. Scoped to VMware devices so an unrelated VPN, filter, or virtual adapter
+    in error does not qualify as the failback ghost-NIC situation.
+#>
+function Test-VmwareAdapterInError {
+    try {
+        $bad = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
+                   $_.PNPClass -eq 'Net' -and
+                   $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 -and
+                   ($_.DeviceID -match 'VEN_15AD' -or $_.Name -match 'vmxnet|VMware')
+               }
+        if ($bad) {
+            foreach ($d in $bad) {
+                Write-Host "VMware net device in error state: $($d.Name) (ConfigManagerErrorCode $($d.ConfigManagerErrorCode))"
+            }
+            return $true
+        }
+    }
+    catch {
+        Write-Warning "Win32_PnPEntity query failed: $($_.Exception.Message)"
+    }
+    return $false
+}
+
+
+<#
+.SYNOPSIS
+    Runs the confirmed manual remediation for the AWS ghost-NIC failure: a device-console
+    cleanup (netcfg -d) that removes ghost NICs and stale network bindings so the current
+    vmxnet3 adapter can leave CM_PROB_REGISTRY and re-enumerate cleanly on the next boot.
+    Non-present AWS/ghost devices are additionally removed via pnputil where supported
+    (pnputil /remove-device is unavailable on Windows Server 2016, so it is skipped there
+    and netcfg -d does the real work).
+#>
+function Repair-AwsGhostNetwork {
+    Write-Host "Starting AWS ghost-network remediation..."
+
+    # Best-effort targeted removal of ghost/AWS net devices (newer OS only).
+    try {
+        $pnputilHelp = & pnputil.exe /? 2>&1 | Out-String
+        if ($pnputilHelp -match '/remove-device') {
+            # Only AWS ghosts and the faulted VMware NIC - never an unrelated error-state adapter.
+            $ghosts = Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | Where-Object {
+                          $_.FriendlyName -match 'Amazon|Elastic Network Adapter|AWS PV' -or
+                          $_.InstanceId  -match 'VEN_1D0F' -or
+                          (($_.Status -eq 'Error') -and (($_.InstanceId -match 'VEN_15AD') -or ($_.FriendlyName -match 'vmxnet|VMware')))
+                      }
+            foreach ($g in $ghosts) {
+                Write-Host "Removing net device: $($g.FriendlyName) [$($g.InstanceId)]"
+                & pnputil.exe /remove-device "$($g.InstanceId)" 2>&1 | Out-Null
+            }
+        } else {
+            Write-Host "pnputil /remove-device is not supported on this OS; relying on netcfg -d."
+        }
+    }
+    catch {
+        Write-Warning "pnputil device removal step failed (non-fatal): $($_.Exception.Message)"
+    }
+
+    # Core remediation: device-console cleanup of all network components.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $out = & netcfg.exe -d 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "netcfg -d succeeded:`n$out"
+        } else {
+            Write-Warning "netcfg -d returned exit code $($LASTEXITCODE):`n$out"
+        }
+    }
+    catch {
+        Write-Warning "netcfg -d failed to launch: $($_.Exception.Message)"
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+
+<#
+.SYNOPSIS
+    Reads the number of remediation attempts recorded in the marker file (0 if absent).
+#>
+function Get-AwsCleanupAttempts {
+    param(
+        [String]$MarkerParam
+    )
+
+    if (Test-Path $MarkerParam) {
+        $raw = (Get-Content $MarkerParam -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $n = 0
+        if ([int]::TryParse($raw, [ref]$n)) { return $n }
+    }
+    return 0
+}
+
+
+<#
+.SYNOPSIS
+    Persists the remediation attempt count so a reboot loop cannot occur.
+#>
+function Set-AwsCleanupAttempts {
+    param(
+        [String]$MarkerParam,
+        [int]$CountParam
+    )
+
+    Set-Content -Path $MarkerParam -Value $CountParam -Force
+    # Flush to disk so the count survives the imminent reboot.
+    try { & fsutil volume flush $env:SystemDrive 2>&1 | Out-Null } catch { }
+}
+
+
+<#
+.SYNOPSIS
+    Removes the remediation attempt marker so a future AWS failback on the same (possibly
+    persistent) install path is not permanently skipped after the attempt budget was spent once.
+#>
+function Clear-AwsCleanupAttempts {
+    param(
+        [String]$MarkerParam
+    )
+
+    if (Test-Path $MarkerParam) {
+        Remove-Item -Path $MarkerParam -Force -ErrorAction SilentlyContinue
+        Write-Host "Cleared AWS remediation attempt marker."
+    }
+}
+
+
+<#
+.SYNOPSIS
+    Detect-and-remediate orchestrator for the V2AWS-failback ghost-NIC failure. When no target MAC
+    resolves to a usable adapter and AWS ghost devices are present, runs netcfg -d and reboots so
+    the vmxnet3 adapter re-enumerates cleanly. Bounded by a marker file to prevent a boot loop.
+
+    Requires the caller to have already registered an AtStartup task so this script re-runs after
+    the reboot; it does not return when it reboots. Does nothing when the adapters are already
+    healthy or the attempt cap has been reached.
+
+    The remediation is gated on TWO conditions so it cannot fire on a non-AWS failure: there must be
+    positive AWS provenance (Test-AwsProvenance) AND the faulted device must be the VMware NIC itself
+    (Test-VmwareAdapterInError). An unrelated VPN/filter/virtual adapter in error, or a VM that was
+    never on AWS, therefore never reaches netcfg -d.
+#>
+function Invoke-AwsGhostRemediationIfNeeded {
+    param(
+        [array]$Nics,
+        [string]$MarkerPath,
+        [int]$MaxAttempts = 1
+    )
+
+    if (Test-TargetAdaptersHealthy -NicsParam $Nics) {
+        # Adapters are healthy - remediation either worked or was never needed. Clear any prior
+        # attempt marker so a later, independent AWS failback on this persistent install path gets
+        # a fresh remediation budget instead of being permanently skipped.
+        Clear-AwsCleanupAttempts -MarkerParam $MarkerPath
+        return
+    }
+
+    $attempts = Get-AwsCleanupAttempts -MarkerParam $MarkerPath
+    if (($attempts -lt $MaxAttempts) -and (Test-AwsProvenance) -and (Test-VmwareAdapterInError)) {
+        Write-Host "Target VMware NIC faulted and AWS provenance confirmed; remediating (attempt $($attempts + 1)/$MaxAttempts)."
+        Set-AwsCleanupAttempts -MarkerParam $MarkerPath -CountParam ($attempts + 1)
+
+        Repair-AwsGhostNetwork
+
+        Invoke-Reboot -Reason "Rebooting so vmxnet3 can re-enumerate; the startup task will resume network configuration."
+    }
+    elseif ($attempts -ge $MaxAttempts) {
+        Write-Warning "Target adapter(s) still not healthy after $attempts remediation attempt(s); not retrying to avoid a boot loop. Network configuration will proceed and likely fail."
+    }
 }
 
 # ===========================================================================================
@@ -921,225 +1299,13 @@ Initialize-ExecutionTracking
 Test-AdminPrivileges
 Invoke-Installation
 Report-CustomerScriptExistence
-Configure-Network
+$nics = @(Get-NicData)
+# On a V2AWS failback, older Windows can come back with the vmxnet3 adapter stuck in
+# CM_PROB_REGISTRY behind AWS ghost devices. When network config is present but no target
+# adapter is healthy, clean up (netcfg -d) and reboot; the scheduled task resumes afterwards.
+if ($script:NetworkConfigPresent) {
+    Invoke-AwsGhostRemediationIfNeeded -Nics $nics -MarkerPath (Join-Path $script:InstallDir 'aws-network-cleanup.attempts') -MaxAttempts 1
+}
+Configure-Network -Nics $nics
 Invoke-CustomerScript
 Complete-Execution
-
-# SIG # Begin signature block
-# MIIobQYJKoZIhvcNAQcCoIIoXjCCKFoCAQExDzANBglghkgBZQMEAgEFADB5Bgor
-# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCpgN5kafPFlsVq
-# uIhJETUuNgGTrcotTdWnYfgXN4m+rKCCDaIwggawMIIEmKADAgECAhAIrUCyYNKc
-# TJ9ezam9k67ZMA0GCSqGSIb3DQEBDAUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
-# EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNV
-# BAMTGERpZ2lDZXJ0IFRydXN0ZWQgUm9vdCBHNDAeFw0yMTA0MjkwMDAwMDBaFw0z
-# NjA0MjgyMzU5NTlaMGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwg
-# SW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBDb2RlIFNpZ25pbmcg
-# UlNBNDA5NiBTSEEzODQgMjAyMSBDQTEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAw
-# ggIKAoICAQDVtC9C0CiteLdd1TlZG7GIQvUzjOs9gZdwxbvEhSYwn6SOaNhc9es0
-# JAfhS0/TeEP0F9ce2vnS1WcaUk8OoVf8iJnBkcyBAz5NcCRks43iCH00fUyAVxJr
-# Q5qZ8sU7H/Lvy0daE6ZMswEgJfMQ04uy+wjwiuCdCcBlp/qYgEk1hz1RGeiQIXhF
-# LqGfLOEYwhrMxe6TSXBCMo/7xuoc82VokaJNTIIRSFJo3hC9FFdd6BgTZcV/sk+F
-# LEikVoQ11vkunKoAFdE3/hoGlMJ8yOobMubKwvSnowMOdKWvObarYBLj6Na59zHh
-# 3K3kGKDYwSNHR7OhD26jq22YBoMbt2pnLdK9RBqSEIGPsDsJ18ebMlrC/2pgVItJ
-# wZPt4bRc4G/rJvmM1bL5OBDm6s6R9b7T+2+TYTRcvJNFKIM2KmYoX7BzzosmJQay
-# g9Rc9hUZTO1i4F4z8ujo7AqnsAMrkbI2eb73rQgedaZlzLvjSFDzd5Ea/ttQokbI
-# YViY9XwCFjyDKK05huzUtw1T0PhH5nUwjewwk3YUpltLXXRhTT8SkXbev1jLchAp
-# QfDVxW0mdmgRQRNYmtwmKwH0iU1Z23jPgUo+QEdfyYFQc4UQIyFZYIpkVMHMIRro
-# OBl8ZhzNeDhFMJlP/2NPTLuqDQhTQXxYPUez+rbsjDIJAsxsPAxWEQIDAQABo4IB
-# WTCCAVUwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQUaDfg67Y7+F8Rhvv+
-# YXsIiGX0TkIwHwYDVR0jBBgwFoAU7NfjgtJxXWRM3y5nP+e6mK4cD08wDgYDVR0P
-# AQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMDMHcGCCsGAQUFBwEBBGswaTAk
-# BggrBgEFBQcwAYYYaHR0cDovL29jc3AuZGlnaWNlcnQuY29tMEEGCCsGAQUFBzAC
-# hjVodHRwOi8vY2FjZXJ0cy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9v
-# dEc0LmNydDBDBgNVHR8EPDA6MDigNqA0hjJodHRwOi8vY3JsMy5kaWdpY2VydC5j
-# b20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNybDAcBgNVHSAEFTATMAcGBWeBDAED
-# MAgGBmeBDAEEATANBgkqhkiG9w0BAQwFAAOCAgEAOiNEPY0Idu6PvDqZ01bgAhql
-# +Eg08yy25nRm95RysQDKr2wwJxMSnpBEn0v9nqN8JtU3vDpdSG2V1T9J9Ce7FoFF
-# UP2cvbaF4HZ+N3HLIvdaqpDP9ZNq4+sg0dVQeYiaiorBtr2hSBh+3NiAGhEZGM1h
-# mYFW9snjdufE5BtfQ/g+lP92OT2e1JnPSt0o618moZVYSNUa/tcnP/2Q0XaG3Ryw
-# YFzzDaju4ImhvTnhOE7abrs2nfvlIVNaw8rpavGiPttDuDPITzgUkpn13c5Ubdld
-# AhQfQDN8A+KVssIhdXNSy0bYxDQcoqVLjc1vdjcshT8azibpGL6QB7BDf5WIIIJw
-# 8MzK7/0pNVwfiThV9zeKiwmhywvpMRr/LhlcOXHhvpynCgbWJme3kuZOX956rEnP
-# LqR0kq3bPKSchh/jwVYbKyP/j7XqiHtwa+aguv06P0WmxOgWkVKLQcBIhEuWTatE
-# QOON8BUozu3xGFYHKi8QxAwIZDwzj64ojDzLj4gLDb879M4ee47vtevLt/B3E+bn
-# KD+sEq6lLyJsQfmCXBVmzGwOysWGw/YmMwwHS6DTBwJqakAwSEs0qFEgu60bhQji
-# WQ1tygVQK+pKHJ6l/aCnHwZ05/LWUpD9r4VIIflXO7ScA+2GRfS0YW6/aOImYIbq
-# yK+p/pQd52MbOoZWeE4wggbqMIIE0qADAgECAhAIPjRpjH9bCQy1JthFZIh9MA0G
-# CSqGSIb3DQEBCwUAMGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwg
-# SW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBDb2RlIFNpZ25pbmcg
-# UlNBNDA5NiBTSEEzODQgMjAyMSBDQTEwHhcNMjYwMjI0MDAwMDAwWhcNMjcwNTI4
-# MjM1OTU5WjByMQswCQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEUMBIG
-# A1UEBxMLU2FudGEgQ2xhcmExGzAZBgNVBAoTElB1cmUgU3RvcmFnZSwgSW5jLjEb
-# MBkGA1UEAxMSUHVyZSBTdG9yYWdlLCBJbmMuMIIBojANBgkqhkiG9w0BAQEFAAOC
-# AY8AMIIBigKCAYEA4xwJviabs6uQveruozp6wXyuolQ+jg0OA/gqVxRob6Byypq8
-# 2b2Y0QQXqm4qJoGCqDP16pYi7qrhwxNvF8+I+CWZbZFzvphuZ/CuV/y3hnETuoNE
-# xqwoIxfQZWyGO0+asQ2s0SjnZrLCRYrilKdpBFbyq5N9MFGFRw/Tzs4uM8qKqPYZ
-# i9PfpFRGVqE+L0FfOLHDpAN2YdxfvyP4rgUBxJK+m7LWFq+Nafxk/gSLV0fQTmLK
-# eTuEpm3tIrQQWArY0aw7/fRpar3Qtyhzbt8AR6EVI9h1orvNyHXMWmGZlhWY9XNt
-# n1bWn7jwiqaxsBPBCvlZ9yt5LQMpxdtEhSV1fJNmtJJTn3h+kbRopfAfw5+kNwM1
-# 7HRnYXOUKgaxCxcH03/9oU6WSoX06BN0Ooei5WmVBVz3V6Nv/pM9B7X5j+x99uFq
-# JIXogYuYM2jtP3zRFcqDjvSqBUYn6SgsXF7C84QTRaVESX+HegJD78OWzQFZ9Yov
-# WynDzBsXgT0e9mnFAgMBAAGjggIDMIIB/zAfBgNVHSMEGDAWgBRoN+Drtjv4XxGG
-# +/5hewiIZfROQjAdBgNVHQ4EFgQULw/ffZ/EI7AYJp4t2dycLBH36L0wPgYDVR0g
-# BDcwNTAzBgZngQwBBAEwKTAnBggrBgEFBQcCARYbaHR0cDovL3d3dy5kaWdpY2Vy
-# dC5jb20vQ1BTMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDAzCB
-# tQYDVR0fBIGtMIGqMFOgUaBPhk1odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGln
-# aUNlcnRUcnVzdGVkRzRDb2RlU2lnbmluZ1JTQTQwOTZTSEEzODQyMDIxQ0ExLmNy
-# bDBToFGgT4ZNaHR0cDovL2NybDQuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3Rl
-# ZEc0Q29kZVNpZ25pbmdSU0E0MDk2U0hBMzg0MjAyMUNBMS5jcmwwgZQGCCsGAQUF
-# BwEBBIGHMIGEMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20w
-# XAYIKwYBBQUHMAKGUGh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2Vy
-# dFRydXN0ZWRHNENvZGVTaWduaW5nUlNBNDA5NlNIQTM4NDIwMjFDQTEuY3J0MAkG
-# A1UdEwQCMAAwDQYJKoZIhvcNAQELBQADggIBAJcvpRhA3k1gD5cjmgLzlZd+kPHH
-# AraHt5SgGYjvM5LctB4vkKmhJow+44+WL4t2jACc1Ht4kbvELlNO0NQvjylzoUEe
-# sdDt008pPBuNx3EhEkclgsn4uoRAYQ3mHi/ypM/0hJYalzwBAR9eebdNrofVZlbt
-# OjYKWJGKq3aoQTIKXKZUGHxxFR1LNSKcgLjCYqDaWrh3Fav2Aft0+wwViOUJb45N
-# r2sGA7af6EqKw2RklVoouSVEikhi9mXZRnusIVcJJmwK6Oq0WlsPtwoPsl8xqElp
-# 7Xy7hXs7XkPPHcwdGP3j8fM+qkwmTUvqcMXdG8aCToCFdBlRKt4/Fl7TvaSZBCym
-# CoKBdqZXpKCSLvjbmo3FPq6JO+i5YZoYhZQZt8C7uI/COEZqFDpRUBTNvWVicAId
-# LUtgR7426LAM3eM9m6uI6vnCVTYyy9n203ygArw7wGU86pwQQ4CaB1vXknhZTEjY
-# SPMn2daiJtdq8vhEUXjF69NkQM/M+b6sOKKtBlKq7mWqCqQ0nevv0hp53XTbm572
-# GI9RMVkNAvmBWvCN23pLaLRcwUR7JEJ8lK98Q3wJJxmaYFz/DkNWAqcYapy5Ggk2
-# AHScSoz6hzh3svILb1y2h+S34oY9pRuTCa0vvLvdy5o6lxcMn+g/i1n504t3H3DR
-# TPtRuWlIfaW6PtqHMYIaITCCGh0CAQEwfTBpMQswCQYDVQQGEwJVUzEXMBUGA1UE
-# ChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQg
-# Q29kZSBTaWduaW5nIFJTQTQwOTYgU0hBMzg0IDIwMjEgQ0ExAhAIPjRpjH9bCQy1
-# JthFZIh9MA0GCWCGSAFlAwQCAQUAoHwwEAYKKwYBBAGCNwIBDDECMAAwGQYJKoZI
-# hvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcC
-# ARUwLwYJKoZIhvcNAQkEMSIEIM9mV+bYGrDJl1djiM1BsqnNRjM/MxScUQFUZ9/u
-# qv8ZMA0GCSqGSIb3DQEBAQUABIIBgHljLK+5Dk5VDjFyh+OQnK8HuQbfn62bQWbE
-# h+MR/9tqc22Er0X+ABW6SP4EgFMminJreioOS9O/nLIwGyDSVey417ZXYz1/cfeY
-# pDnIAwpH93EcP3B77w0FBlSvE/Q+CLvCMZZaGZ3Ab5VbaK4thGGsOCZVsoJerQ3u
-# atYu4mEFawfTyYYVhrHDB8NlRfX7WESHVsAyiqg9aL3lGYaBlvZqhvIE89p69Tps
-# QIMsf3PxxQpYLnxxOIWmLFYG0jvT8SdjNJOBeO5ivGmhvuet0FxvpgBh9F3nmju+
-# LnLcxoB8yYXKojGeqMZ4xQSJyDX7aMPPrbXCwGXrZTn6BQF7Y9bQZXt3xMNOXpF3
-# EG+5Hu89gtLfLkdJIzx1n+pJLx9pJRvN7ht7rI80XXSQBbTEYOZbEtExScDmqqEn
-# x7M5ueWMtzSHAOwAQVYwawZninEvIoYJ9uDzZ/oEQHCnWu2n20/XveBG5kS3MOSd
-# 9eiZMq8/4RRNh5Qc+Js+KL/bD6+m5KGCF3cwghdzBgorBgEEAYI3AwMBMYIXYzCC
-# F18GCSqGSIb3DQEHAqCCF1AwghdMAgEDMQ8wDQYJYIZIAWUDBAIBBQAweAYLKoZI
-# hvcNAQkQAQSgaQRnMGUCAQEGCWCGSAGG/WwHATAxMA0GCWCGSAFlAwQCAQUABCBR
-# /lhGoitsAeHelLeTwW7omJxRyYjbvo36azfdiDS03wIRAPa8S3CkwzrHOqpzehW2
-# EZ4YDzIwMjYwNzE0MDcyNjQ0WqCCEzowggbtMIIE1aADAgECAhAKgO8YS43xBYLR
-# xHanlXRoMA0GCSqGSIb3DQEBCwUAMGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5E
-# aWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1l
-# U3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTEwHhcNMjUwNjA0MDAwMDAw
-# WhcNMzYwOTAzMjM1OTU5WjBjMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNl
-# cnQsIEluYy4xOzA5BgNVBAMTMkRpZ2lDZXJ0IFNIQTI1NiBSU0E0MDk2IFRpbWVz
-# dGFtcCBSZXNwb25kZXIgMjAyNSAxMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
-# CgKCAgEA0EasLRLGntDqrmBWsytXum9R/4ZwCgHfyjfMGUIwYzKomd8U1nH7C8Dr
-# 0cVMF3BsfAFI54um8+dnxk36+jx0Tb+k+87H9WPxNyFPJIDZHhAqlUPt281mHrBb
-# ZHqRK71Em3/hCGC5KyyneqiZ7syvFXJ9A72wzHpkBaMUNg7MOLxI6E9RaUueHTQK
-# WXymOtRwJXcrcTTPPT2V1D/+cFllESviH8YjoPFvZSjKs3SKO1QNUdFd2adw44wD
-# cKgH+JRJE5Qg0NP3yiSyi5MxgU6cehGHr7zou1znOM8odbkqoK+lJ25LCHBSai25
-# CFyD23DZgPfDrJJJK77epTwMP6eKA0kWa3osAe8fcpK40uhktzUd/Yk0xUvhDU6l
-# vJukx7jphx40DQt82yepyekl4i0r8OEps/FNO4ahfvAk12hE5FVs9HVVWcO5J4dV
-# mVzix4A77p3awLbr89A90/nWGjXMGn7FQhmSlIUDy9Z2hSgctaepZTd0ILIUbWuh
-# KuAeNIeWrzHKYueMJtItnj2Q+aTyLLKLM0MheP/9w6CtjuuVHJOVoIJ/DtpJRE7C
-# e7vMRHoRon4CWIvuiNN1Lk9Y+xZ66lazs2kKFSTnnkrT3pXWETTJkhd76CIDBbTR
-# ofOsNyEhzZtCGmnQigpFHti58CSmvEyJcAlDVcKacJ+A9/z7eacCAwEAAaOCAZUw
-# ggGRMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFOQ7/PIx7f391/ORcWMZUEPPYYzo
-# MB8GA1UdIwQYMBaAFO9vU0rp5AZ8esrikFb2L9RJ7MtOMA4GA1UdDwEB/wQEAwIH
-# gDAWBgNVHSUBAf8EDDAKBggrBgEFBQcDCDCBlQYIKwYBBQUHAQEEgYgwgYUwJAYI
-# KwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBdBggrBgEFBQcwAoZR
-# aHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZEc0VGlt
-# ZVN0YW1waW5nUlNBNDA5NlNIQTI1NjIwMjVDQTEuY3J0MF8GA1UdHwRYMFYwVKBS
-# oFCGTmh0dHA6Ly9jcmwzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
-# bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNybDAgBgNVHSAEGTAXMAgG
-# BmeBDAEEAjALBglghkgBhv1sBwEwDQYJKoZIhvcNAQELBQADggIBAGUqrfEcJwS5
-# rmBB7NEIRJ5jQHIh+OT2Ik/bNYulCrVvhREafBYF0RkP2AGr181o2YWPoSHz9iZE
-# N/FPsLSTwVQWo2H62yGBvg7ouCODwrx6ULj6hYKqdT8wv2UV+Kbz/3ImZlJ7YXwB
-# D9R0oU62PtgxOao872bOySCILdBghQ/ZLcdC8cbUUO75ZSpbh1oipOhcUT8lD8QA
-# GB9lctZTTOJM3pHfKBAEcxQFoHlt2s9sXoxFizTeHihsQyfFg5fxUFEp7W42fNBV
-# N4ueLaceRf9Cq9ec1v5iQMWTFQa0xNqItH3CPFTG7aEQJmmrJTV3Qhtfparz+BW6
-# 0OiMEgV5GWoBy4RVPRwqxv7Mk0Sy4QHs7v9y69NBqycz0BZwhB9WOfOu/CIJnzkQ
-# TwtSSpGGhLdjnQ4eBpjtP+XB3pQCtv4E5UCSDag6+iX8MmB10nfldPF9SVD7weCC
-# 3yXZi/uuhqdwkgVxuiMFzGVFwYbQsiGnoa9F5AaAyBjFBtXVLcKtapnMG3VH3EmA
-# p/jsJ3FVF3+d1SVDTmjFjLbNFZUWMXuZyvgLfgyPehwJVxwC+UpX2MSey2ueIu9T
-# HFVkT+um1vshETaWyQo8gmBto/m3acaP9QsuLj3FNwFlTxq25+T4QwX9xa6ILs84
-# ZPvmpovq90K8eWyG2N01c4IhSOxqt81nMIIGtDCCBJygAwIBAgIQDcesVwX/IZku
-# QEMiDDpJhjANBgkqhkiG9w0BAQsFADBiMQswCQYDVQQGEwJVUzEVMBMGA1UEChMM
-# RGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQuY29tMSEwHwYDVQQD
-# ExhEaWdpQ2VydCBUcnVzdGVkIFJvb3QgRzQwHhcNMjUwNTA3MDAwMDAwWhcNMzgw
-# MTE0MjM1OTU5WjBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIElu
-# Yy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJT
-# QTQwOTYgU0hBMjU2IDIwMjUgQ0ExMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
-# CgKCAgEAtHgx0wqYQXK+PEbAHKx126NGaHS0URedTa2NDZS1mZaDLFTtQ2oRjzUX
-# MmxCqvkbsDpz4aH+qbxeLho8I6jY3xL1IusLopuW2qftJYJaDNs1+JH7Z+QdSKWM
-# 06qchUP+AbdJgMQB3h2DZ0Mal5kYp77jYMVQXSZH++0trj6Ao+xh/AS7sQRuQL37
-# QXbDhAktVJMQbzIBHYJBYgzWIjk8eDrYhXDEpKk7RdoX0M980EpLtlrNyHw0Xm+n
-# t5pnYJU3Gmq6bNMI1I7Gb5IBZK4ivbVCiZv7PNBYqHEpNVWC2ZQ8BbfnFRQVESYO
-# szFI2Wv82wnJRfN20VRS3hpLgIR4hjzL0hpoYGk81coWJ+KdPvMvaB0WkE/2qHxJ
-# 0ucS638ZxqU14lDnki7CcoKCz6eum5A19WZQHkqUJfdkDjHkccpL6uoG8pbF0LJA
-# QQZxst7VvwDDjAmSFTUms+wV/FbWBqi7fTJnjq3hj0XbQcd8hjj/q8d6ylgxCZSK
-# i17yVp2NL+cnT6Toy+rN+nM8M7LnLqCrO2JP3oW//1sfuZDKiDEb1AQ8es9Xr/u6
-# bDTnYCTKIsDq1BtmXUqEG1NqzJKS4kOmxkYp2WyODi7vQTCBZtVFJfVZ3j7OgWmn
-# hFr4yUozZtqgPrHRVHhGNKlYzyjlroPxul+bgIspzOwbtmsgY1MCAwEAAaOCAV0w
-# ggFZMBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFO9vU0rp5AZ8esrikFb2
-# L9RJ7MtOMB8GA1UdIwQYMBaAFOzX44LScV1kTN8uZz/nupiuHA9PMA4GA1UdDwEB
-# /wQEAwIBhjATBgNVHSUEDDAKBggrBgEFBQcDCDB3BggrBgEFBQcBAQRrMGkwJAYI
-# KwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBBBggrBgEFBQcwAoY1
-# aHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZFJvb3RH
-# NC5jcnQwQwYDVR0fBDwwOjA4oDagNIYyaHR0cDovL2NybDMuZGlnaWNlcnQuY29t
-# L0RpZ2lDZXJ0VHJ1c3RlZFJvb3RHNC5jcmwwIAYDVR0gBBkwFzAIBgZngQwBBAIw
-# CwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQAXzvsWgBz+Bz0RdnEwvb4L
-# yLU0pn/N0IfFiBowf0/Dm1wGc/Do7oVMY2mhXZXjDNJQa8j00DNqhCT3t+s8G0iP
-# 5kvN2n7Jd2E4/iEIUBO41P5F448rSYJ59Ib61eoalhnd6ywFLerycvZTAz40y8S4
-# F3/a+Z1jEMK/DMm/axFSgoR8n6c3nuZB9BfBwAQYK9FHaoq2e26MHvVY9gCDA/JY
-# sq7pGdogP8HRtrYfctSLANEBfHU16r3J05qX3kId+ZOczgj5kjatVB+NdADVZKON
-# /gnZruMvNYY2o1f4MXRJDMdTSlOLh0HCn2cQLwQCqjFbqrXuvTPSegOOzr4EWj7P
-# tspIHBldNE2K9i697cvaiIo2p61Ed2p8xMJb82Yosn0z4y25xUbI7GIN/TpVfHIq
-# Q6Ku/qjTY6hc3hsXMrS+U0yy+GWqAXam4ToWd2UQ1KYT70kZjE4YtL8Pbzg0c1ug
-# MZyZZd/BdHLiRu7hAWE6bTEm4XYRkA6Tl4KSFLFk43esaUeqGkH/wyW4N7Oigizw
-# JWeukcyIPbAvjSabnf7+Pu0VrFgoiovRDiyx3zEdmcif/sYQsfch28bZeUz2rtY/
-# 9TCA6TD8dC3JE3rYkrhLULy7Dc90G6e8BlqmyIjlgp2+VqsS9/wQD7yFylIz0scm
-# bKvFoW2jNrbM1pD2T7m3XDCCBY0wggR1oAMCAQICEA6bGI750C3n79tQ4ghAGFow
-# DQYJKoZIhvcNAQEMBQAwZTELMAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0
-# IEluYzEZMBcGA1UECxMQd3d3LmRpZ2ljZXJ0LmNvbTEkMCIGA1UEAxMbRGlnaUNl
-# cnQgQXNzdXJlZCBJRCBSb290IENBMB4XDTIyMDgwMTAwMDAwMFoXDTMxMTEwOTIz
-# NTk1OVowYjELMAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcG
-# A1UECxMQd3d3LmRpZ2ljZXJ0LmNvbTEhMB8GA1UEAxMYRGlnaUNlcnQgVHJ1c3Rl
-# ZCBSb290IEc0MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAv+aQc2je
-# u+RdSjwwIjBpM+zCpyUuySE98orYWcLhKac9WKt2ms2uexuEDcQwH/MbpDgW61bG
-# l20dq7J58soR0uRf1gU8Ug9SH8aeFaV+vp+pVxZZVXKvaJNwwrK6dZlqczKU0RBE
-# EC7fgvMHhOZ0O21x4i0MG+4g1ckgHWMpLc7sXk7Ik/ghYZs06wXGXuxbGrzryc/N
-# rDRAX7F6Zu53yEioZldXn1RYjgwrt0+nMNlW7sp7XeOtyU9e5TXnMcvak17cjo+A
-# 2raRmECQecN4x7axxLVqGDgDEI3Y1DekLgV9iPWCPhCRcKtVgkEy19sEcypukQF8
-# IUzUvK4bA3VdeGbZOjFEmjNAvwjXWkmkwuapoGfdpCe8oU85tRFYF/ckXEaPZPfB
-# aYh2mHY9WV1CdoeJl2l6SPDgohIbZpp0yt5LHucOY67m1O+SkjqePdwA5EUlibaa
-# RBkrfsCUtNJhbesz2cXfSwQAzH0clcOP9yGyshG3u3/y1YxwLEFgqrFjGESVGnZi
-# fvaAsPvoZKYz0YkH4b235kOkGLimdwHhD5QMIR2yVCkliWzlDlJRR3S+Jqy2QXXe
-# eqxfjT/JvNNBERJb5RBQ6zHFynIWIgnffEx1P2PsIV/EIFFrb7GrhotPwtZFX50g
-# /KEexcCPorF+CiaZ9eRpL5gdLfXZqbId5RsCAwEAAaOCATowggE2MA8GA1UdEwEB
-# /wQFMAMBAf8wHQYDVR0OBBYEFOzX44LScV1kTN8uZz/nupiuHA9PMB8GA1UdIwQY
-# MBaAFEXroq/0ksuCMS1Ri6enIZ3zbcgPMA4GA1UdDwEB/wQEAwIBhjB5BggrBgEF
-# BQcBAQRtMGswJAYIKwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBD
-# BggrBgEFBQcwAoY3aHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0
-# QXNzdXJlZElEUm9vdENBLmNydDBFBgNVHR8EPjA8MDqgOKA2hjRodHRwOi8vY3Js
-# My5kaWdpY2VydC5jb20vRGlnaUNlcnRBc3N1cmVkSURSb290Q0EuY3JsMBEGA1Ud
-# IAQKMAgwBgYEVR0gADANBgkqhkiG9w0BAQwFAAOCAQEAcKC/Q1xV5zhfoKN0Gz22
-# Ftf3v1cHvZqsoYcs7IVeqRq7IviHGmlUIu2kiHdtvRoU9BNKei8ttzjv9P+Aufih
-# 9/Jy3iS8UgPITtAq3votVs/59PesMHqai7Je1M/RQ0SbQyHrlnKhSLSZy51PpwYD
-# E3cnRNTnf+hZqPC/Lwum6fI0POz3A8eHqNJMQBk1RmppVLC4oVaO7KTVPeix3P0c
-# 2PR3WlxUjG/voVA9/HYJaISfb8rbII01YBwCA8sgsKxYoA5AY8WYIsGyWfVVa88n
-# q2x2zm8jLfR+cWojayL/ErhULSd+2DrZ8LaHlv1b0VysGMNNn3O3AamfV6peKOK5
-# lDGCA3wwggN4AgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0
-# LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGlu
-# ZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0aDANBglg
-# hkgBZQMEAgEFAKCB0TAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwHAYJKoZI
-# hvcNAQkFMQ8XDTI2MDcxNDA3MjY0NFowKwYLKoZIhvcNAQkQAgwxHDAaMBgwFgQU
-# 3WIwrIYKLTBr2jixaHlSMAf7QX4wLwYJKoZIhvcNAQkEMSIEIKu/abfT6h/j3GIi
-# MRXOLNLnQcQzCIefeDrbm5CqiCK1MDcGCyqGSIb3DQEJEAIvMSgwJjAkMCIEIEqg
-# P6Is11yExVyTj4KOZ2ucrsqzP+NtJpqjNPFGEQozMA0GCSqGSIb3DQEBAQUABIIC
-# ACYFE62Q24ifDRbLHZw/cxlT0fTJHj85ToWfpKzuIsaJMSjgzMHICb1XYT4GT4v4
-# SQsqAy0Zu+xNOwrWJtHpSw8hVNgt2aTvpgqI4jRBvQ6jlRo1p62tU+sDBI3TjuNn
-# DkIkdk0i/vBWptMTWbSOIyEty6uOByTBqbx9il3FA59y7tD4KwqpSq9a8lAgoa1J
-# kYwQF8DUdlXmEQdqx1NLMQXXJFZnnw9J43cVJtHhRY2UYY9kx8uUju0uld5ouLTH
-# 7UkCxiXdFNM9G7Ikl0+Uj/pl3nJV1TN4wuqrcl4R59zbSysNRi/JE82KORJuh9NB
-# pUX25b6w4KVaQFOJydeztz6a85TG9vSecQfwsrgqRw6XrETDZhTDc+ZuDhNX++RN
-# 1o9xBbQ8gZnuKdy3Npdkfi7zRLi/Jbu9NgQa2UWNRptromf7opddZ2ffXM9BlJoZ
-# TnuxZBZPSPu7K85wVKVtZg1f1uXEEDjeiIQedIGQGp+6qoQ/u7yPux22u+XvWM0r
-# kE3GKJwN18Kshrj+h/WFMr6w4d+1OTG76x7sE9Uw5JBCw8iJo06+hd3dNHJF6cxh
-# mhwZdMsXkmtI8ogRtTq+zVYHtzYB60xn2C8UZogCsMCRR/iWSmHvtYurfa5tvApX
-# xxoQjVeF3/XEIY9sTl4TaB5QM9yum3yLyEEhx5mzoxFN
-# SIG # End signature block

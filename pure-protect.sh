@@ -26,7 +26,7 @@ IFS=$IFS, # adds comma as delimiter character for splitting DNS addresses
 # ===========================================================================================
 # Installation & Scheduling Configuration
 # ===========================================================================================
-SCRIPT_VERSION="2.8.0"
+SCRIPT_VERSION="2.25.0"
 INSTALL_PATH="/usr/local/pureprotect/scripts/configurator.sh"
 INSTALL_DIR=$(dirname "$INSTALL_PATH")
 SERVICE_NAME="pureprotect-configurator.service"
@@ -465,8 +465,50 @@ EOF
   log_message "[netplan] Static network settings applied successfully"
 }
 
+disable_competing_connections() {
+  local iface=$1 mac=$2 keep=$3
+  local uuid name intf cmac
+
+  while IFS= read -r uuid; do
+    [[ -z "$uuid" ]] && continue
+
+    name=$(nmcli -g connection.id connection show "$uuid" 2>/dev/null) || true
+    [[ "$name" == "$keep" ]] && continue
+
+    intf=$(nmcli -g connection.interface-name connection show "$uuid" 2>/dev/null) || true
+    cmac=$(nmcli -g 802-3-ethernet.mac-address connection show "$uuid" 2>/dev/null) || true
+
+    if [[ "$intf" == "$iface" ]] || { [[ -n "$cmac" ]] && [[ "${cmac,,}" == "${mac,,}" ]]; }; then
+      log_message "[NetworkManager] Disabling autoconnect on competing connection '$name' ($uuid) bound to $iface"
+      if nmcli connection modify "$uuid" connection.autoconnect no >/dev/null 2>&1; then
+        # Release the device now if this profile currently holds it; harmless otherwise.
+        nmcli connection down "$uuid" >/dev/null 2>&1 || true
+      else
+        log_message "[NetworkManager] WARNING: failed to disable autoconnect on '$name' ($uuid)"
+      fi
+    fi
+  done < <(nmcli -t -f UUID connection show)
+}
+
+delete_draas_connections() {
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      draas-nic*)
+        log_message "[NetworkManager] Deleting existing connection '$name'"
+        nmcli connection delete "$name" >/dev/null 2>&1 \
+          || log_message "[NetworkManager] WARNING: failed to delete connection '$name'"
+        ;;
+    esac
+  done < <(nmcli -t -f NAME connection show)
+}
+
 configure_network_manager() {
   log_message "[NetworkManager] Configuring static network settings"
+
+  # Delete every draas-nic* profile from a previous recovery, up front and
+  # regardless of the current NIC set.
+  delete_draas_connections
 
   for idx in "${!NIC_MACS[@]}"; do
     mac="${NIC_MACS[$idx]}"
@@ -485,18 +527,15 @@ configure_network_manager() {
     fi
     log_message "[NetworkManager] Found interface: $iface"
 
-    # Delete any existing connection with this name
-    if nmcli -t -f NAME connection show | grep -Fxq "$conn_name"; then
-      log_message "[NetworkManager] Deleting existing connection '$conn_name'"
-      nmcli connection delete "$conn_name" >/dev/null
-    fi
-
-    # Create new static connection
+    # Create new static connection. A high autoconnect-priority makes this profile
+    # win the interface at boot over any profile left at the default priority 0.
     if [[ -z "$gateway" ]]; then
         add_cmd=(nmcli connection add type ethernet ifname "$iface" con-name "$conn_name" autoconnect yes
+             connection.autoconnect-priority 999
              ipv4.method manual ipv4.addresses "$ipaddr" ipv4.dns "$dns" ipv6.method ignore)
     else
         add_cmd=(nmcli connection add type ethernet ifname "$iface" con-name "$conn_name" autoconnect yes
+            connection.autoconnect-priority 999
             ipv4.method manual ipv4.addresses "$ipaddr" ipv4.gateway "$gateway" ipv4.dns "$dns" ipv6.method ignore)
     fi
 
@@ -513,6 +552,10 @@ configure_network_manager() {
       report_network_result 13 "[NetworkManager] WARNING: Failed to activate connection '$conn_name'"
       return
     fi
+
+    # With draas-nic<idx> now holding the interface, disable autoconnect on every
+    # other profile bound to it so the interface cannot be reclaimed on reboot.
+    disable_competing_connections "$iface" "$mac" "$conn_name"
   done
 
   log_message "[NetworkManager] Static network settings applied."
@@ -793,6 +836,7 @@ configure_network() {
     report_network_result 0 "Network configuration completed successfully"
   fi
 }
+
 # ===========================================================================================
 # Customer Script Execution
 # ===========================================================================================
