@@ -1,4 +1,5 @@
-### Everpure Resilience service — In-Guest ToolsInstallation and User Guide
+### Everpure Resilience service — In-Guest Tools
+Installation and User Guide
 
 *Applies to [tools version 2.25.0](https://github.com/PureStorage-OpenConnect/everpureresilience-tools/releases/tag/2.25.0) · Windows and Linux*
 
