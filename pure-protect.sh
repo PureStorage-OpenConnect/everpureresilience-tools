@@ -26,7 +26,7 @@ IFS=$IFS, # adds comma as delimiter character for splitting DNS addresses
 # ===========================================================================================
 # Installation & Scheduling Configuration
 # ===========================================================================================
-SCRIPT_VERSION="2.25.0"
+SCRIPT_VERSION="2.34.0"
 INSTALL_PATH="/usr/local/pureprotect/scripts/configurator.sh"
 INSTALL_DIR=$(dirname "$INSTALL_PATH")
 SERVICE_NAME="pureprotect-configurator.service"
