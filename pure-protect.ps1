@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 # Capture full script content at top level (required for Invoke-Expression scenarios)
 $script:ScriptContent = $MyInvocation.MyCommand.ScriptBlock.ToString()
 
-$script:ScriptVersion = "2.25.0"
+$script:ScriptVersion = "2.34.0"
 $script:InstallPath = "C:\PureProtect\Scripts\configurator.ps1"
 $script:InstallDir = Split-Path -Parent $script:InstallPath
 $script:LogTimestampSuffix = (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss")
@@ -277,6 +277,27 @@ function Remove-OldLogFiles {
     }
 }
 
+function Invoke-Rpctool {
+    param([string]$Command)
+    # Some hosts (PowerShell ISE, `2>&1` callers) turn rpctool stderr into error records.
+    # 'Stop' then makes each stderr line terminate the script, so capture stderr in every host.
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $script:RpctoolPath $Command 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    $stdout = @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+    $stderr = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = "$stdout".Trim()
+        Error = "$stderr".Trim()
+    }
+}
+
 function Get-GuestInfo {
     param([string]$Key)
     Test-VmWareTools
@@ -287,16 +308,15 @@ function Get-GuestInfo {
     }
     # Avoids vmtoolsd RPC throttle that returns empty results or hangs ~2s on back-to-back calls.
     Start-Sleep -Milliseconds 100
-    try {
-        $result = & $script:RpctoolPath "info-get $fullKey"
-    } catch {
-        Write-Host "[Get-GuestInfo] VMware Tools error on '$fullKey': $($_.Exception.Message). Retrying once after tools check..."
+    $result = Invoke-Rpctool "info-get $fullKey"
+    if ($result.ExitCode -ne 0 -and $result.Error -notmatch "No value found") {
+        Write-Host "[Get-GuestInfo] VMware Tools error on '$fullKey': $($result.Error). Retrying once after tools check..."
         Test-VmWareTools
         Start-Sleep -Milliseconds 100
-        $result = & $script:RpctoolPath "info-get $fullKey"
+        $result = Invoke-Rpctool "info-get $fullKey"
     }
-    if ($LASTEXITCODE -eq 0) {
-        return "$result".Trim()
+    if ($result.ExitCode -eq 0) {
+        return $result.Output
     }
     return $null
 }
@@ -318,16 +338,15 @@ function Set-GuestInfo {
     Test-VmWareTools
     $fullKey = "guestinfo.pureprotect.script.$Key"
     Start-Sleep -Milliseconds 100
-    try {
-        $result = & $script:RpctoolPath "info-set $fullKey $Value"
-    } catch {
-        Write-Host "[Set-GuestInfo] VMware Tools error on '$fullKey': $($_.Exception.Message). Retrying once after tools check..."
+    $result = Invoke-Rpctool "info-set $fullKey $Value"
+    if ($result.ExitCode -ne 0) {
+        Write-Host "[Set-GuestInfo] VMware Tools error on '$fullKey': $($result.Error). Retrying once after tools check..."
         Test-VmWareTools
         Start-Sleep -Milliseconds 100
-        $result = & $script:RpctoolPath "info-set $fullKey $Value"
+        $result = Invoke-Rpctool "info-set $fullKey $Value"
     }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "[Set-GuestInfo] Failed to set $fullKey"
+    if ($result.ExitCode -ne 0) {
+        Write-Warning "[Set-GuestInfo] Failed to set ${fullKey}: $($result.Error)"
     }
 }
 
@@ -722,6 +741,111 @@ function Get-NetIPAddressWithRetry {
 
 <#
 .SYNOPSIS
+    Logs whether DHCP and APIPA are enabled on an interface and which IPv4 addresses it has.
+.DESCRIPTION
+    ipconfig /all shows most of this already, but logging it explicitly per step makes a failed run
+    much easier to investigate. APIPA is enabled unless IPAutoconfigurationEnabled is 0 - the
+    per-interface value takes precedence over the global one, and a missing value means enabled.
+    Diagnostics only, so a failed query is logged and never fails the configuration.
+#>
+function Write-IPv4State {
+    param(
+        [int]$InterfaceIndex,
+        [string]$InterfaceGuid,
+        [string]$Stage
+    )
+
+    $prefix = "[Network configuration] [$Stage]"
+
+    try {
+        $ipInterface = Get-NetIPInterface -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop
+        Write-Host "$prefix DHCP enabled: $($ipInterface.Dhcp)"
+    } catch {
+        Write-Host "$prefix DHCP enabled: unknown ($($_.Exception.Message))"
+    }
+
+    $tcpipParameters = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+    $globalApipa     = Get-ItemProperty -Path $tcpipParameters -Name IPAutoconfigurationEnabled -ErrorAction SilentlyContinue
+    $interfaceApipa  = Get-ItemProperty -Path "$tcpipParameters\Interfaces\$InterfaceGuid" -Name IPAutoconfigurationEnabled -ErrorAction SilentlyContinue
+    $globalValue     = if ($globalApipa) { $globalApipa.IPAutoconfigurationEnabled } else { $null }
+    $interfaceValue  = if ($interfaceApipa) { $interfaceApipa.IPAutoconfigurationEnabled } else { $null }
+    $effectiveValue  = if ($null -ne $interfaceValue) { $interfaceValue } elseif ($null -ne $globalValue) { $globalValue } else { 1 }
+    $globalText      = if ($null -ne $globalValue) { $globalValue } else { '<not set>' }
+    $interfaceText   = if ($null -ne $interfaceValue) { $interfaceValue } else { '<not set>' }
+    Write-Host "$prefix APIPA enabled: $($effectiveValue -ne 0) (IPAutoconfigurationEnabled interface $InterfaceGuid = $interfaceText, global = $globalText)"
+
+    # Get-NetIPAddress throws when nothing matches, an interface without an IPv4 address is a valid state here.
+    $addresses = @()
+    try {
+        $addresses = @(Get-NetIPAddress -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop)
+    } catch {
+        Write-Host "$prefix Get-NetIPAddress returned no address ($($_.Exception.Message))"
+    }
+    foreach ($address in $addresses) {
+        Write-Host "$prefix IPv4 address: $($address.IPAddress)/$($address.PrefixLength) (PrefixOrigin $($address.PrefixOrigin), SuffixOrigin $($address.SuffixOrigin), AddressState $($address.AddressState))"
+    }
+
+    $apipaAddresses = @($addresses | Where-Object { $_.IPAddress -like '169.254.*' } | ForEach-Object { $_.IPAddress })
+    if ($apipaAddresses.Count -gt 0) {
+        Write-Host "$prefix APIPA address present: $($apipaAddresses -join ', ')"
+    } else {
+        Write-Host "$prefix APIPA address present: none"
+    }
+}
+
+<#
+.SYNOPSIS
+    Returns the APIPA (169.254.0.0/16) addresses on an interface other than the given static IP.
+#>
+function Get-ApipaAddress {
+    param(
+        [string]$InterfaceAlias,
+        [string]$StaticIPAddress
+    )
+
+    return @(Get-NetIPAddressWithRetry -InterfaceAlias $InterfaceAlias |
+        Where-Object { $_ -like '169.254.*' -and $_ -ne $StaticIPAddress })
+}
+
+<#
+.SYNOPSIS
+    Removes an APIPA address left on an interface after setting a static IP, and fails if it stays.
+.DESCRIPTION
+    Windows can keep the APIPA address assigned for a short while after EnableStatic(), which then
+    fails the IP verification on an extra address. Remove-NetIPAddress is synchronous, so the check
+    right after it shows whether the address is really gone.
+#>
+function Remove-ApipaAddress {
+    param(
+        [string]$InterfaceAlias,
+        [string]$StaticIPAddress
+    )
+
+    $apipaAddresses = Get-ApipaAddress -InterfaceAlias $InterfaceAlias -StaticIPAddress $StaticIPAddress
+    if ($apipaAddresses.Count -eq 0) {
+        Write-Host "[Network configuration] No APIPA address left on $InterfaceAlias"
+        return
+    }
+
+    foreach ($apipaAddress in $apipaAddresses) {
+        Write-Host "[Network configuration] Removing APIPA address $apipaAddress from $InterfaceAlias"
+        try {
+            Remove-NetIPAddress -InterfaceAlias $InterfaceAlias -IPAddress $apipaAddress -Confirm:$false -ErrorAction Stop
+        } catch {
+            # The address may have gone away on its own in the meantime - the check below decides.
+            Write-Host "[Network configuration] Removing APIPA address $apipaAddress failed: $($_.Exception.Message)"
+        }
+    }
+
+    $apipaAddresses = Get-ApipaAddress -InterfaceAlias $InterfaceAlias -StaticIPAddress $StaticIPAddress
+    if ($apipaAddresses.Count -gt 0) {
+        throw "[Network configuration] APIPA address $($apipaAddresses -join ', ') is still assigned to $InterfaceAlias after removal"
+    }
+    Write-Host "[Network configuration] Removed APIPA address from $InterfaceAlias"
+}
+
+<#
+.SYNOPSIS
     Removes any IPv4 default route on the given interface from both the active and persistent stores.
 .DESCRIPTION
     SetGateways() with an empty DefaultIPGateway array does not reliably remove the live
@@ -855,11 +979,18 @@ function Configure-Network {
             $alias = $adapter.Name
             Write-Host "[Network configuration] Configuring adapter: $alias (MAC $TargetMac)"
 
+            Write-IPv4State -InterfaceIndex $adapter.InterfaceIndex -InterfaceGuid $adapter.InterfaceGuid -Stage 'Before static IP'
+
             # ─── Atomically disable DHCP and set static IPv4 ────────────────────
             Set-StaticIPViaCim -InterfaceIndex $adapter.InterfaceIndex `
                                -IPAddress      $NewIPv4 `
                                -PrefixLength   $NewMaskBits
             Write-Host "[Network configuration] Set static IP $NewIPv4/$NewMaskBits for $alias"
+
+            Write-IPv4State -InterfaceIndex $adapter.InterfaceIndex -InterfaceGuid $adapter.InterfaceGuid -Stage 'After static IP'
+
+            # ─── Remove an APIPA address that outlived the static IP ────────────
+            Remove-ApipaAddress -InterfaceAlias $alias -StaticIPAddress $NewIPv4
 
             # ─── Set or clear default gateway ───────────────────────────────────
             if ($NewGateway -and $NewGateway -ne '') {
@@ -933,9 +1064,76 @@ function Invoke-NetworkRegistryFlush {
     }
 }
 
+<#
+.SYNOPSIS
+    Flushes the registry and the file system buffers of the system volume to disk, so the changes made so far
+    are persisted even when the VM is powered off abruptly or its disk is captured before a clean shutdown.
+    Best-effort - failures are logged, not fatal.
+.NOTES
+    The volume is flushed by FlushFileBuffers on a handle to the volume - the documented way to flush all open files
+    on a volume, available on every Windows version. 'fsutil volume flush' does the same, but it does not exist on
+    Windows Server 2012 - 2019 ("flush is an invalid parameter").
+#>
+function Invoke-DiskFlush {
+    try {
+        # Force garbage collection to release any open registry handles (e.g. from Remove-Item)
+        # This ensures all handles are properly closed before we flush
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+
+        # Flush registry changes to disk to ensure they are persisted immediately
+        [Microsoft.Win32.Registry]::LocalMachine.Flush()
+        Write-Host "Registry flushed to disk successfully"
+
+        # Flush file system buffers to physical disk
+        if (-not ('PureProtect.VolumeFlush' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace PureProtect {
+    public static class VolumeFlush {
+        private const uint GenericWrite = 0x40000000;
+        private const uint FileShareReadWrite = 0x3;
+        private const uint OpenExisting = 3;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(string fileName, uint desiredAccess, uint shareMode,
+            IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FlushFileBuffers(SafeFileHandle file);
+
+        // Writes the buffered data of all open files on the volume (e.g. "C:") to disk. Requires admin rights.
+        public static void Flush(string volume) {
+            using (SafeFileHandle handle = CreateFile(@"\\.\" + volume, GenericWrite, FileShareReadWrite,
+                    IntPtr.Zero, OpenExisting, 0, IntPtr.Zero)) {
+                if (handle.IsInvalid || !FlushFileBuffers(handle)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+            }
+        }
+    }
+}
+'@
+        }
+        $driveLetter = $env:SystemDrive
+        [PureProtect.VolumeFlush]::Flush($driveLetter)
+        Write-Host "Disk flush completed successfully for $driveLetter"
+    }
+    catch {
+        Write-Warning "Disk flush failed: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-Reboot {
     param([string]$Reason = "Rebooting machine...")
     Write-Host $Reason
+    # Persist all changes before restarting - the VM can be hard powered off before the restart completes
+    Invoke-DiskFlush
     shutdown.exe /r /t 5 /f
     Stop-Transcript | Out-Null
     exit 0
@@ -1137,7 +1335,7 @@ function Set-AwsCleanupAttempts {
 
     Set-Content -Path $MarkerParam -Value $CountParam -Force
     # Flush to disk so the count survives the imminent reboot.
-    try { & fsutil volume flush $env:SystemDrive 2>&1 | Out-Null } catch { }
+    Invoke-DiskFlush
 }
 
 
